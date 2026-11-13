@@ -1,0 +1,67 @@
+name: deciders
+
+# Одна карта и один PORT. Запускайте один сервис:
+#   docker compose up -d clef
+#   docker compose up -d clef-flash
+
+services:
+  clef:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: deciders-clef
+    env_file: .env
+    environment:
+      HF_HOME: /cache/huggingface
+      HF_HUB_CACHE: /cache/huggingface/hub
+      HUGGINGFACE_HUB_CACHE: /cache/huggingface/hub
+      QUANT_DIR: /models/clef
+    volumes:
+      - hf-cache:/cache/huggingface
+      - weights:/models/clef
+    ports:
+      - "${PORT}:${PORT}"
+    ipc: host
+    shm_size: 32gb
+    init: true
+    restart: unless-stopped
+    gpus: all
+    healthcheck:
+      disable: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  clef-flash:
+    image: lmsysorg/sglang:dev-clef
+    profiles: ["clef-flash"]
+    env_file: .env
+    environment:
+      HF_HOME: /cache/huggingface
+      HF_HUB_CACHE: /cache/huggingface/hub
+      HUGGINGFACE_HUB_CACHE: /cache/huggingface/hub
+      CLEF_CONFIG: /opt/jevs/clef-flash/config.yaml
+    entrypoint: ["python3", "/opt/jevs/clef-flash/entrypoint.py"]
+    volumes:
+      - ./clef-flash:/opt/jevs/clef-flash:ro
+      - hf-cache:/cache/huggingface
+    ports:
+      - "${PORT}:${PORT}"
+    ipc: host
+    shm_size: 32gb
+    init: true
+    restart: unless-stopped
+    gpus: all
+    healthcheck:
+      disable: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+volumes:
+  hf-cache:
+  weights:
