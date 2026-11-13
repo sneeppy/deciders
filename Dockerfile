@@ -17,7 +17,10 @@ RUN python3 -m venv /opt/clef --system-site-packages \
         "packaging>=20.0" \
         filelock \
         "numpy>=1.17" \
-        requests
+        requests \
+    && TV="$(/opt/clef/bin/python -c 'import torch; v=torch.__version__.split("+")[0].split("."); print(f"0.{int(v[1])+15}.{v[2]}")')" \
+    && CU="$(/opt/clef/bin/python -c 'import torch; c=torch.version.cuda or ""; print(("cu"+c.replace(".","")) if c else "")')" \
+    && /opt/clef/bin/pip install --no-deps "torchvision==${TV}" --index-url "https://download.pytorch.org/whl/${CU}"
 
 COPY clef /opt/jevs/clef
 
