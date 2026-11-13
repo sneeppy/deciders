@@ -1,8 +1,8 @@
 """Собирает 4-битный Clef с поворотом Адамара.
 
 Качает Cloudflare/clef в кэш Hugging Face и пишет упакованные веса в QUANT_DIR.
-Сборка идёт на CPU: процесс прячет CUDA, видеокарту не занимает.
-Пиковое потребление памяти — один тензор, на этом сервере с 128 ГБ это помещается.
+Поворот и квантование считаются на GPU, на диск уходит уже упакованный тензор.
+Знаки строятся на CPU: тот же вектор заново собирается при загрузке модели.
 
 Запуск:
 
@@ -15,8 +15,6 @@ import os
 import shutil
 import sys
 from pathlib import Path
-
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import torch
 from huggingface_hub import snapshot_download
@@ -34,8 +32,9 @@ LOOKUP_WEIGHTS = {
 
 
 class ShardReader:
-    def __init__(self, root):
+    def __init__(self, root, device):
         self.root = root
+        self.device = device
         self.path = None
         self.handle = None
 
@@ -44,7 +43,7 @@ class ShardReader:
         if self.path != path:
             if self.handle is not None:
                 self.handle.close()
-            self.handle = safe_open(path, framework="pt", device="cpu")
+            self.handle = safe_open(path, framework="pt", device=self.device)
             self.path = path
         return self.handle.get_tensor(name)
 
@@ -72,8 +71,12 @@ def copy_sidecars(source, dest):
 
 def load_manifest(path):
     if not path.is_file():
-        return {"complete": False, "source": SOURCE, "tensors": {}}
+        return {"complete": False, "source": SOURCE, "device": "cuda", "tensors": {}}
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def to_cpu(tensor):
+    return tensor.detach().to(device="cpu").contiguous()
 
 
 def write_manifest(path, manifest):
@@ -87,15 +90,13 @@ def quantize_int8(weight):
     group = group_size(hidden)
     if group is None:
         return None
-    codes = torch.empty(rows, hidden, dtype=torch.int8)
-    scales = torch.empty(rows, hidden // group, dtype=torch.float16)
-    for start in range(0, rows, 2048):
-        chunk = weight[start : start + 2048].float().reshape(-1, hidden // group, group)
-        scale = chunk.abs().amax(dim=-1).clamp(min=1e-8) / 127
-        quantized = torch.round(chunk / scale.unsqueeze(-1)).clamp(-127, 127).to(torch.int8)
-        codes[start : start + 2048] = quantized.reshape(-1, hidden)
-        scales[start : start + 2048] = scale.to(torch.float16)
-    return {"codes": codes, "scales": scales}, group
+    grouped = weight.to(dtype=torch.float32).reshape(rows, hidden // group, group)
+    scale = grouped.abs().amax(dim=-1).clamp(min=1e-8) / 127
+    codes = torch.round(grouped / scale.unsqueeze(-1)).clamp(-127, 127).to(torch.int8)
+    return {
+        "codes": to_cpu(codes.reshape(rows, hidden)),
+        "scales": to_cpu(scale.to(dtype=torch.float16)),
+    }, group
 
 
 def quantize_hadamard(name, weight):
@@ -104,19 +105,14 @@ def quantize_hadamard(name, weight):
     group = group_size(width)
     if block is None or group is None or width % 2 != 0:
         return None
-    signs = sign_vector(name, width).to(torch.float32)
-    packed = torch.empty(out_features, width // 2, dtype=torch.uint8)
-    scales = torch.empty(out_features, width // group, dtype=torch.float16)
-    for start in range(0, out_features, 2048):
-        rotated = block_hadamard(weight[start : start + 2048].float() * signs, block)
-        grouped = rotated.reshape(-1, width // group, group)
-        scale = grouped.abs().amax(dim=-1).clamp(min=1e-8) / 7
-        codes = torch.round(grouped / scale.unsqueeze(-1)).clamp(-7, 7)
-        nibbles = (codes + 7).to(torch.uint8).reshape(-1, width)
-        packed[start : start + rotated.shape[0]] = nibbles[:, 0::2] | (nibbles[:, 1::2] << 4)
-        scales[start : start + rotated.shape[0]] = scale.to(torch.float16)
-        del rotated, grouped, codes, nibbles
-    return {"packed": packed, "scales": scales}, block, group
+    signs = sign_vector(name, width).to(device=weight.device, dtype=torch.float32)
+    rotated = block_hadamard(weight.to(dtype=torch.float32) * signs, block)
+    grouped = rotated.reshape(out_features, width // group, group)
+    scale = grouped.abs().amax(dim=-1).clamp(min=1e-8) / 7
+    codes = torch.round(grouped / scale.unsqueeze(-1)).clamp(-7, 7)
+    nibbles = (codes + 7).to(dtype=torch.uint8).reshape(out_features, width)
+    packed = nibbles[:, 0::2] | (nibbles[:, 1::2] << 4)
+    return {"packed": to_cpu(packed), "scales": to_cpu(scale.to(dtype=torch.float16))}, block, group
 
 
 def tensor_file(dest, name):
@@ -130,9 +126,15 @@ def main():
     (DEST / "tensors").mkdir(parents=True, exist_ok=True)
     index = json.loads((snapshot / "model.safetensors.index.json").read_text(encoding="utf-8"))
     weight_map = index["weight_map"]
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA не видна. Квантование считается на видеокарте.")
     manifest_path = DEST / "manifest.json"
     manifest = load_manifest(manifest_path)
-    reader = ShardReader(snapshot)
+    if manifest["tensors"] and not manifest.get("complete") and manifest.get("device") != "cuda":
+        raise SystemExit("квантование уже начато на CPU. Очистите каталог весов и запустите quantize заново.")
+    if not (manifest.get("complete") and manifest["tensors"] and manifest.get("device") != "cuda"):
+        manifest["device"] = "cuda"
+    reader = ShardReader(snapshot, "cuda")
     done = 0
     try:
         names = [name for name in weight_map if not name.endswith(".bias")]
@@ -153,34 +155,35 @@ def main():
             tensor = reader.get(weight_map[name], name)
             path = tensor_file(DEST, name)
             bundled_bias = None
-            if name in LOOKUP_WEIGHTS:
-                quantized = quantize_int8(tensor)
-                if quantized is None:
-                    payload = {"tensor": tensor.contiguous()}
+            with torch.inference_mode():
+                if name in LOOKUP_WEIGHTS:
+                    quantized = quantize_int8(tensor)
+                    if quantized is None:
+                        payload = {"tensor": to_cpu(tensor)}
+                        kind = "bf16"
+                        extra = {}
+                    else:
+                        payload, group = quantized
+                        kind = "int8_rows"
+                        extra = {"group": group, "shape": list(tensor.shape)}
+                elif name.endswith("pos_embed.weight") or tensor.ndim != 2:
+                    payload = {"tensor": to_cpu(tensor)}
                     kind = "bf16"
                     extra = {}
                 else:
-                    payload, group = quantized
-                    kind = "int8_rows"
-                    extra = {"group": group, "shape": list(tensor.shape)}
-            elif name.endswith("pos_embed.weight") or tensor.ndim != 2:
-                payload = {"tensor": tensor.contiguous()}
-                kind = "bf16"
-                extra = {}
-            else:
-                quantized = quantize_hadamard(name, tensor)
-                if quantized is None:
-                    payload = {"tensor": tensor.contiguous()}
-                    kind = "bf16"
-                    extra = {}
-                else:
-                    payload, block, group = quantized
-                    kind = "hadamard_int4"
-                    extra = {"block": block, "group": group, "shape": list(tensor.shape)}
-                    bias_name = name[: -len("weight")] + "bias"
-                    if bias_name in weight_map:
-                        bundled_bias = bias_name
-                        payload["bias"] = reader.get(weight_map[bias_name], bias_name).contiguous()
+                    quantized = quantize_hadamard(name, tensor)
+                    if quantized is None:
+                        payload = {"tensor": to_cpu(tensor)}
+                        kind = "bf16"
+                        extra = {}
+                    else:
+                        payload, block, group = quantized
+                        kind = "hadamard_int4"
+                        extra = {"block": block, "group": group, "shape": list(tensor.shape)}
+                        bias_name = name[: -len("weight")] + "bias"
+                        if bias_name in weight_map:
+                            bundled_bias = bias_name
+                            payload["bias"] = to_cpu(reader.get(weight_map[bias_name], bias_name))
             save_file(payload, path)
             relative = path.relative_to(DEST).as_posix()
             manifest["tensors"][name] = {"kind": kind, "file": relative, **extra}
