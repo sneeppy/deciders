@@ -35,23 +35,11 @@ class ShardReader:
     def __init__(self, root, device):
         self.root = root
         self.device = device
-        self.path = None
-        self.handle = None
 
     def get(self, shard, name):
         path = self.root / shard
-        if self.path != path:
-            if self.handle is not None:
-                self.handle.close()
-            self.handle = safe_open(path, framework="pt", device=self.device)
-            self.path = path
-        return self.handle.get_tensor(name)
-
-    def close(self):
-        if self.handle is not None:
-            self.handle.close()
-            self.handle = None
-            self.path = None
+        with safe_open(path, framework="pt", device=self.device) as handle:
+            return handle.get_tensor(name)
 
 
 def copy_sidecars(source, dest):
@@ -136,67 +124,64 @@ def main():
         manifest["device"] = "cuda"
     reader = ShardReader(snapshot, "cuda")
     done = 0
-    try:
-        names = [name for name in weight_map if not name.endswith(".bias")]
-        names += [name for name in weight_map if name.endswith(".bias")]
-        for number, name in enumerate(names, start=1):
-            entry = manifest["tensors"].get(name)
-            if entry and (DEST / entry["file"]).is_file():
+    names = [name for name in weight_map if not name.endswith(".bias")]
+    names += [name for name in weight_map if name.endswith(".bias")]
+    for number, name in enumerate(names, start=1):
+        entry = manifest["tensors"].get(name)
+        if entry and (DEST / entry["file"]).is_file():
+            done += 1
+            continue
+        if name.endswith(".bias"):
+            weight_name = name[: -len("bias")] + "weight"
+            weight_entry = manifest["tensors"].get(weight_name)
+            if weight_entry and weight_entry["kind"] == "hadamard_int4":
+                manifest["tensors"][name] = {"kind": "with_weight", "file": weight_entry["file"]}
+                write_manifest(manifest_path, manifest)
                 done += 1
                 continue
-            if name.endswith(".bias"):
-                weight_name = name[: -len("bias")] + "weight"
-                weight_entry = manifest["tensors"].get(weight_name)
-                if weight_entry and weight_entry["kind"] == "hadamard_int4":
-                    manifest["tensors"][name] = {"kind": "with_weight", "file": weight_entry["file"]}
-                    write_manifest(manifest_path, manifest)
-                    done += 1
-                    continue
-            tensor = reader.get(weight_map[name], name)
-            path = tensor_file(DEST, name)
-            bundled_bias = None
-            with torch.inference_mode():
-                if name in LOOKUP_WEIGHTS:
-                    quantized = quantize_int8(tensor)
-                    if quantized is None:
-                        payload = {"tensor": to_cpu(tensor)}
-                        kind = "bf16"
-                        extra = {}
-                    else:
-                        payload, group = quantized
-                        kind = "int8_rows"
-                        extra = {"group": group, "shape": list(tensor.shape)}
-                elif name.endswith("pos_embed.weight") or tensor.ndim != 2:
+        tensor = reader.get(weight_map[name], name)
+        path = tensor_file(DEST, name)
+        bundled_bias = None
+        with torch.inference_mode():
+            if name in LOOKUP_WEIGHTS:
+                quantized = quantize_int8(tensor)
+                if quantized is None:
                     payload = {"tensor": to_cpu(tensor)}
                     kind = "bf16"
                     extra = {}
                 else:
-                    quantized = quantize_hadamard(name, tensor)
-                    if quantized is None:
-                        payload = {"tensor": to_cpu(tensor)}
-                        kind = "bf16"
-                        extra = {}
-                    else:
-                        payload, block, group = quantized
-                        kind = "hadamard_int4"
-                        extra = {"block": block, "group": group, "shape": list(tensor.shape)}
-                        bias_name = name[: -len("weight")] + "bias"
-                        if bias_name in weight_map:
-                            bundled_bias = bias_name
-                            payload["bias"] = to_cpu(reader.get(weight_map[bias_name], bias_name))
-            save_file(payload, path)
-            relative = path.relative_to(DEST).as_posix()
-            manifest["tensors"][name] = {"kind": kind, "file": relative, **extra}
-            if bundled_bias is not None:
-                manifest["tensors"][bundled_bias] = {"kind": "with_weight", "file": relative}
-            manifest["complete"] = False
-            write_manifest(manifest_path, manifest)
-            done += 1
-            print(f"{number}/{len(names)} {kind} {tuple(tensor.shape)} {name}", flush=True)
-            del tensor, payload
-            gc.collect()
-    finally:
-        reader.close()
+                    payload, group = quantized
+                    kind = "int8_rows"
+                    extra = {"group": group, "shape": list(tensor.shape)}
+            elif name.endswith("pos_embed.weight") or tensor.ndim != 2:
+                payload = {"tensor": to_cpu(tensor)}
+                kind = "bf16"
+                extra = {}
+            else:
+                quantized = quantize_hadamard(name, tensor)
+                if quantized is None:
+                    payload = {"tensor": to_cpu(tensor)}
+                    kind = "bf16"
+                    extra = {}
+                else:
+                    payload, block, group = quantized
+                    kind = "hadamard_int4"
+                    extra = {"block": block, "group": group, "shape": list(tensor.shape)}
+                    bias_name = name[: -len("weight")] + "bias"
+                    if bias_name in weight_map:
+                        bundled_bias = bias_name
+                        payload["bias"] = to_cpu(reader.get(weight_map[bias_name], bias_name))
+        save_file(payload, path)
+        relative = path.relative_to(DEST).as_posix()
+        manifest["tensors"][name] = {"kind": kind, "file": relative, **extra}
+        if bundled_bias is not None:
+            manifest["tensors"][bundled_bias] = {"kind": "with_weight", "file": relative}
+        manifest["complete"] = False
+        write_manifest(manifest_path, manifest)
+        done += 1
+        print(f"{number}/{len(names)} {kind} {tuple(tensor.shape)} {name}", flush=True)
+        del tensor, payload
+        gc.collect()
     missing = [name for name in weight_map if name not in manifest["tensors"]]
     if missing:
         raise SystemExit(f"не записаны тензоры: {missing[:5]}")
