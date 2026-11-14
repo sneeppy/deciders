@@ -11,7 +11,7 @@
 
 ## Что нужно
 
-Docker с поддержкой NVIDIA GPU и доступ в Hugging Face. Квантование полного Clef считает поворот и упаковку на видеокарте и пишет один тензор за раз. Инференс `clef` тоже требует CUDA. `clef-flash` рассчитан на карту уровня RTX 4500: в `clef-flash/config.yaml` под веса и KV отдано 90% памяти.
+Docker с поддержкой NVIDIA GPU и доступ в Hugging Face. Оба сервиса берут образ `lmsysorg/sglang:dev-clef`: в нём уже CUDA-сборка PyTorch и `transformers`. Сервис `clef` только дописывает свой код и при необходимости `accelerate`/`torchvision`. Квантование полного Clef считает поворот и упаковку на видеокарте. `clef-flash` рассчитан на карту уровня RTX 4500: в `clef-flash/config.yaml` под веса и KV отдано 90% памяти.
 
 ## Настройка
 

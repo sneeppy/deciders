@@ -1,31 +1,26 @@
-# Образ нужен как готовый PyTorch с CUDA. Сервер внутри свой, SGLang не запускается.
+# База — официальный образ SGLang для Clef. В нём уже есть torch с CUDA,
+# transformers, huggingface_hub, safetensors, pillow и остальной стек.
+# Не переустанавливаем его: pip иначе тянет чужой torch с PyPI.
+# Карточка Cloudflare/clef проверяла transformers 5.10.2; образ SGLang
+# отдаёт Clef на своём (более новом) transformers — так и задумано в cookbook.
 FROM lmsysorg/sglang:dev-clef
 
-# transformers без зависимостей, чтобы pip не заменил CUDA-сборку PyTorch.
-# Версии ниже — минимум, который transformers 5.10.2 проверяет при импорте.
-RUN python3 -m venv /opt/clef --system-site-packages \
-    && /opt/clef/bin/pip install --no-deps "transformers==5.10.2" \
-    && /opt/clef/bin/pip install \
-        "huggingface_hub>=1.5.0,<2.0" \
-        "safetensors>=0.4.3" \
-        "accelerate>=1.1.0" \
-        pillow \
-        "regex>=2025.10.22" \
-        "tokenizers>=0.22.0,<=0.23.0" \
-        "pyyaml>=5.1" \
-        "tqdm>=4.27" \
-        "packaging>=20.0" \
-        filelock \
-        "numpy>=1.17" \
-        requests \
-    && TV="$(/opt/clef/bin/python -c 'import torch; v=torch.__version__.split("+")[0].split("."); print(f"0.{int(v[1])+15}.{v[2]}")')" \
-    && CU="$(/opt/clef/bin/python -c 'import torch; c=torch.version.cuda or ""; print(("cu"+c.replace(".","")) if c else "")')" \
-    && /opt/clef/bin/pip install --no-deps "torchvision==${TV}" --index-url "https://download.pytorch.org/whl/${CU}"
+# accelerate — init_empty_weights при загрузке квантованных весов.
+# torchvision — AutoProcessor поднимает видеокласс даже без videos в запросе.
+# Ставим только если в образе нет, и только --no-deps под уже стоящий torch.
+RUN set -eux; \
+    python3 -c "import accelerate" \
+      || python3 -m pip install --no-deps "accelerate>=1.1.0"; \
+    if ! python3 -c "import torchvision"; then \
+      TV="$(python3 -c 'import torch; v=torch.__version__.split("+")[0].split("."); print(f"0.{int(v[1])+15}.{v[2]}")')"; \
+      CU="$(python3 -c 'import torch; c=torch.version.cuda or ""; print(("cu"+c.replace(".","")) if c else "")')"; \
+      echo "install torchvision==${TV} index=${CU}"; \
+      python3 -m pip install --no-deps "torchvision==${TV}" --index-url "https://download.pytorch.org/whl/${CU}"; \
+    fi
 
 COPY clef /opt/jevs/clef
 
-ENV PATH=/opt/clef/bin:$PATH
 ENV PYTHONUNBUFFERED=1
 WORKDIR /opt/jevs
-ENTRYPOINT ["python", "-m", "clef"]
+ENTRYPOINT ["python3", "-m", "clef"]
 CMD ["serve"]
