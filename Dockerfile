@@ -1,8 +1,6 @@
 # База — официальный образ SGLang для Clef. В нём уже есть torch с CUDA,
 # transformers, huggingface_hub, safetensors, pillow и остальной стек.
 # Не переустанавливаем его: pip иначе тянет чужой torch с PyPI.
-# Карточка Cloudflare/clef проверяла transformers 5.10.2; образ SGLang
-# отдаёт Clef на своём (более новом) transformers — так и задумано в cookbook.
 FROM lmsysorg/sglang:dev-clef
 
 # accelerate — init_empty_weights при загрузке квантованных весов.
@@ -17,6 +15,15 @@ RUN set -eux; \
       echo "install torchvision==${TV} index=${CU}"; \
       python3 -m pip install --no-deps "torchvision==${TV}" --index-url "https://download.pytorch.org/whl/${CU}"; \
     fi
+
+# Критически важные оптимизированные ядра для архитектуры Clef (Gated DeltaNet).
+# Без них transformers падает в эталонную PyTorch-реализацию и inference
+# становится в разы медленнее. Устанавливаем с --no-build-isolation, чтобы
+# компиляция CUDA-расширений использовала torch из базового образа.
+RUN set -eux; \
+    python3 -m pip install -U --no-build-isolation "flash-linear-attention==0.5.2"; \
+    python3 -m pip install -U --no-build-isolation "git+https://github.com/Dao-AILab/causal-conv1d.git"; \
+    python3 -c "import causal_conv1d; import fla; print('causal_conv1d and fla OK')"
 
 COPY clef /opt/jevs/clef
 
