@@ -1,33 +1,21 @@
 name: deciders
 
-# Одна карта и один PORT. Запускайте один сервис:
-#   docker compose up -d clef
-#   docker compose up -d clef-flash
+# Одна карта. Запускайте один сервис:
+#   docker compose up -d clef        — полный Clef через Ollama (порт 11434, только localhost)
+#   docker compose up -d clef-flash  — Clef-Flash через SGLang (порт из .env)
 
 services:
   clef:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: deciders-clef
-    env_file: .env
+    image: ollama/ollama
     environment:
-      HF_HOME: /cache/huggingface
-      HF_HUB_CACHE: /cache/huggingface/hub
-      HUGGINGFACE_HUB_CACHE: /cache/huggingface/hub
-      QUANT_DIR: /models/clef
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_KV_CACHE_TYPE: q8_0
     volumes:
-      - hf-cache:/cache/huggingface
-      - weights:/models/clef
+      - ollama:/root/.ollama
     ports:
-      - "${PORT}:${PORT}"
-    ipc: host
-    shm_size: 32gb
-    init: true
-    restart: unless-stopped
+      - "127.0.0.1:11434:11434"
     gpus: all
-    healthcheck:
-      disable: true
+    restart: unless-stopped
     logging:
       driver: json-file
       options:
@@ -64,4 +52,6 @@ services:
 
 volumes:
   hf-cache:
-  weights:
+  ollama:
+    external: true
+    name: ollama
