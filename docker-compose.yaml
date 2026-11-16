@@ -1,7 +1,7 @@
 name: deciders
 
 # Одна карта. Запускайте один сервис:
-#   docker compose up -d clef        — полный Clef через Ollama (порт 11434, только localhost)
+#   docker compose up -d clef        — полный Clef через Ollama (порт из .env, только localhost)
 #   docker compose up -d clef-flash  — Clef-Flash через SGLang (порт из .env)
 
 services:
@@ -13,14 +13,7 @@ services:
     volumes:
       - ollama:/root/.ollama
     ports:
-      - "127.0.0.1:11434:11434"
-    gpus: all
-    restart: unless-stopped
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "3"
+      - "127.0.0.1:${PORT}:11434"
 
   clef-flash:
     image: lmsysorg/sglang:dev-clef

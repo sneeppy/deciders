@@ -2,16 +2,18 @@
 
 Сервер решений на [Cloudflare Clef](https://huggingface.co/Cloudflare/clef). Принимает состояние и вопросы, возвращает ответ с вероятностями. Генерации текста нет: один проход модели и голова схемы.
 
-Два сервиса, один порт и одна видеокарта. Запускайте только один из них.
+Одна видеокарта. Запускайте один сервис.
 
-| Сервис | Как считается | Когда нужен |
+| Сервис | Как считается | Порт |
 |---|---|---|
-| `clef` | свои int4/int8-веса и HTTP-сервер на PyTorch | полный Clef, меньше памяти на карте |
-| `clef-flash` | `Cloudflare/clef-flash` через SGLang | готовый Flash-образ без своей квантизации |
+| `clef` | [Ollama](https://ollama.com/library/clef), модель `clef` | `127.0.0.1:$PORT` |
+| `clef-flash` | `Cloudflare/clef-flash` через SGLang | `0.0.0.0:$PORT` |
 
 ## Что нужно
 
-Docker с поддержкой NVIDIA GPU и доступ в Hugging Face. Оба сервиса берут образ `lmsysorg/sglang:dev-clef`: в нём уже CUDA-сборка PyTorch и `transformers`. Сервис `clef` только дописывает свой код и при необходимости `accelerate`/`torchvision`. Квантование полного Clef считает поворот и упаковку на видеокарте. `clef-flash` рассчитан на карту уровня RTX 4500: в `clef-flash/config.yaml` под веса и KV отдано 90% памяти.
+Docker с NVIDIA GPU. Для `clef` нужен Ollama 0.35.1 или новее: это версия образа `ollama/ollama`. Для `clef-flash` — доступ в Hugging Face.
+
+На RTX 4500 Ada полный Clef влезает не целиком: часть слоёв остаётся на CPU, окно тега — 16384 токена. Запрос длиннее этого Ollama отклоняет, а не обрезает.
 
 ## Настройка
 
@@ -21,66 +23,53 @@ cp .env.example .env
 
 В `.env`:
 
-- `CLEF_API_KEY` — ключ для `Authorization: Bearer`. Пустое значение сервер не примет.
-- `PORT` — порт на хосте и в контейнере.
-- `CONTEXT_LENGTH` — окно токенов только для сервиса `clef`, по умолчанию 65536.
-- `HF_TOKEN` — если Hub просит авторизацию. Раскомментируйте строку в `.env`.
+- `PORT` — порт на хосте. У `clef` он проброшен только на `127.0.0.1`, внутри контейнера Ollama слушает 11434. У `clef-flash` тот же номер открыт на всех интерфейсах.
+- `CLEF_API_KEY` — ключ `clef-flash` (`Authorization: Bearer`). Ollama его не проверяет.
+- `HF_TOKEN` — если Hub просит авторизацию для Flash. Раскомментируйте строку.
 
-У `clef-flash` длина контекста, число одновременных запросов и доля памяти карты задаются в `clef-flash/config.yaml`, не в `.env`. Образ SGLang обрезает запрос на 16384, и в конфиге стоит этот потолок.
+Окно, число запросов и доля памяти карты у Flash задаются в `clef-flash/config.yaml`. Образ SGLang обрезает запрос на 16384.
 
 ## Полный Clef
 
-Сборка образа, квантование, затем сервер:
+Том `ollama` должен уже существовать: в нём лежат скачанные веса. На новой машине:
 
 ```bash
-docker compose build clef
-docker compose run --rm clef quantize
-docker compose up -d clef
+docker volume create ollama
 ```
 
-`quantize` скачивает `Cloudflare/clef`, копирует конфиги и код схемы и пишет упакованные веса в том `weights` (`/models/clef`). Поворот и int4/int8 считаются на GPU. Повторный запуск продолжает с `manifest.json` и не переписывает уже готовые тензоры. Сервер стартует только если в манифесте `"complete": true`. Если каталог весов остался от прерванного прогона на CPU, очистите том и запустите `quantize` заново.
+Запуск:
 
-Как пакуются веса:
+```bash
+docker compose up -d clef
+docker compose exec clef ollama pull clef
+```
 
-- матрицы слоёв — знаки, блочный поворот Адамара и int4 по группам;
-- `embed_tokens` и `lm_head` — int8 по строкам, их индексируют как таблицу токенов;
-- bias, позиционные эмбеддинги и голова решений остаются bf16.
-
-На каждом forward вход поворачивается теми же знаками, вес int4 распаковывается в bf16. Поворот ортогонален, поэтому без квантования линейный слой не меняется. Это проверяет `tests/test_rotation.py`.
+Повторный `pull` ничего не качает, если модель уже в томе. Первый запрос после старта грузит её в память и занимает десятки секунд. Следующие идут из уже загруженной модели, она держится 5 минут после последнего запроса.
 
 Логи: `docker compose logs -f clef`. Остановка: `docker compose stop clef`.
 
 ## Clef Flash
 
-Профиль `clef-flash` не входит в обычный `up`. Сервис поднимается явно:
+Профиль `clef-flash` не входит в обычный `up`:
 
 ```bash
 docker compose up -d clef-flash
 ```
 
-Образ `lmsysorg/sglang:dev-clef` не собирается заново. `clef-flash/entrypoint.py` читает конфиг и заменяет себя на `sglang serve`. Модель — `Cloudflare/clef-flash`, окно промпта — 16384 токена. Одновременно обрабатывается один запрос.
+`clef-flash/entrypoint.py` читает конфиг и заменяет себя на `sglang serve`. Одновременно обрабатывается один запрос.
 
-Не поднимайте `clef` и `clef-flash` вместе: оба публикуют `${PORT}`.
+Не поднимайте `clef` и `clef-flash` вместе: оба занимают видеокарту и хостовый `$PORT`.
 
 ## Запросы к полному Clef
 
-Ниже — сервер `clef`. `clef-flash` отдаёт API SGLang, маршрут `/v1/systemone` у него не появляется.
+`clef` — это Ollama. `clef-flash` отдаёт свой API SGLang.
 
-Проверка, что процесс жив. Без заголовка авторизации отвечает 200. Неверный ключ — 401.
-
-```bash
-curl -s "http://127.0.0.1:${PORT}/health"
-```
-
-Решение — `POST /v1/systemone`. Тело до 64 МБ, поля `model`, `state` и непустой словарь `questions`. Тип вопроса: `noul`, `choice` или `score`. У `choice` и `score` список `criteria` не пустой. Картинки — необязательный список data URL или ссылок `http(s)`, каждая до 20 МБ. Поле `videos` сервер полного Clef отклоняет.
-
-Форма `state` и то, как вопросы собираются в токены, задаются схемой из снимка модели (`joint_schema_model`), а не этим репозиторием.
+У каждого вопроса должно быть поле `instructions`, в том числе у `score`. Картинки — base64, без приставки `data:`.
 
 ```bash
 curl -s "http://127.0.0.1:${PORT}/v1/systemone" \
-  -H "Authorization: Bearer $CLEF_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"clef","state":{},"questions":{"q":{"type":"noul"}}}'
+  -d '{"model":"clef","state":"Our checkout started returning errors and orders are blocked.","questions":{"department":{"type":"choice","instructions":"Which team should handle the message?","criteria":{"billing":"Payments or invoices","technical":"Bugs or outages"}},"urgency":{"type":"score","instructions":"How soon does this need attention?","criteria":["Can wait","This week","Today"]},"outage":{"type":"noul","instructions":"Is a service down?"}}}'
 ```
 
 Ответы:
@@ -89,16 +78,4 @@ curl -s "http://127.0.0.1:${PORT}/v1/systemone" \
 - `choice` — выбранный вариант, уверенность и вероятности по `criteria`;
 - `score` — математическое ожидание индекса, легенда и вероятности уровней `"0"`, `"1"`, …
 
-Уверенность равна нулю при равномерном распределении и единице, когда вся масса на одном исходе. `usage.output_tokens` всегда 0.
-
-Сервер полный Clef однопоточный: на время forward не отвечает и `/health`.
-
-## Проверка поворота
-
-Тест не входит в образ. Локально, при установленном PyTorch:
-
-```bash
-python tests/test_rotation.py
-```
-
-Он проверяет, что повторный поворот Адамара возвращает вектор, что поворот весов и входа не меняет линейный слой и что int4 остаётся близко к повёрнутому слою.
+`usage.output_tokens` равен 0.
